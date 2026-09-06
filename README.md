@@ -18,7 +18,7 @@ sense without it, and it is the half that matters most in an interview.
 | Part | What it covers | Read it when |
 |---|---|---|
 | [01 — The problem](01-the-problem/) | Who this is for, what is actually broken, why the design is forced | First. Always first |
-| [02 — How it works](02-how-it-works/) | Architecture, the rule engine, scheme files, conversation, Telegram, output | You want the technical picture |
+| [02 — How it works](02-how-it-works/) | Architecture, the rule engine, **one scheme traced end to end**, scheme files, conversation, Telegram | You want the technical picture |
 | [03 — Quality](03-quality/) | Testing, every bug and what it taught, the safety model | You want to know whether to trust it |
 | [04 — Operations](04-operations/) | Deployment, the live host, what to do when it breaks | You need to run or fix it |
 | [05 — Assessment](05-assessment/) | Scored breakdown with evidence, and what is unfinished | You want the honest state |
