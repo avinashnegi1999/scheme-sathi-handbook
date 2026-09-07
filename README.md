@@ -24,6 +24,7 @@ sense without it, and it is the half that matters most in an interview.
 | [05 — Assessment](05-assessment/) | Scored breakdown with evidence, and what is unfinished | You want the honest state |
 | [06 — Interview](06-interview/) | The story, a self-test, numbers to know cold | You have an interview |
 | [07 — Appendix](07-appendix/) | Glossary, file map | You hit a term or a filename you do not recognise |
+| [08 — Video](08-video/) | The 10-minute build-story script, and the 3-minute demo narration | You are recording, or you want the story in spoken form |
 
 ## The shortest possible summary
 
