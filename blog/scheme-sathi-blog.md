@@ -589,11 +589,132 @@ None of those were hard. All were invisible until the thing actually ran.
 
 Now: 1s → 60s exponential backoff, reset on the first success.
 
+### 10. The same bug, one layer up
+
+This is my favourite of the lot, in the way a bug becomes your favourite when it teaches you something about yourself rather than about the code.
+
+The Uttarakhand old-age pension and the widow pension are alternative routes to the *same* state payment. A 65-year-old widow qualifies for both; the state pays one. I had already met this problem and solved it. Scheme files carry `exclusive_group = "uk_state_pension"`, and `engine.value_totals()` collapses a group to its largest member before summing. The worker sees ₹18,000. Correct.
+
+The **dashboard** did this:
+
+```sql
+SELECT scheme_code, SUM(value_inr)
+FROM events
+WHERE event_type='scheme_newly_surfaced'
+GROUP BY scheme_code
+```
+
+No sessions. No groups. That same widow contributes ₹18,000 twice, and the impact page reports **₹36,000 of annual entitlement surfaced** for one woman entitled to ₹18,000.
+
+Read the direction of that failure carefully. The worker was told the truth. The number *about* the worker was inflated. That is the worse way round, because an inflated statistic is never caught by using the product — it is caught by someone reading the code, or by nobody at all, and it ends up in a submission form.
+
+I wrote `exclusive_group` specifically to prevent this. Then I wrote a second place that computes the same quantity and did not use it. **A fix that lives in one function protects one caller.** `templates.py` and `pack.py` were both made to call `value_totals()`; `report.py` never was, because it reads the event log rather than a live result, and I never made the connection.
+
+The fix groups per session. The second half of the test matters as much as the first:
+
+```python
+assert split["payout"] == 54000   # one widow: two pensions collapse, plus PM-SYM
+assert split["payout"] == 72000   # two DIFFERENT widows: still two entitlements
+```
+
+Collapsing is not deduplication. Sessions are unlinkable by design, so two visits by one person still count twice — a real limitation, but a separate and disclosed one.
+
+Found by an outside review reading the repository. Not by 2,541 walked paths.
+
+### 11. I built a privacy feature and leaked it at the proxy
+
+The application sheet used to be sent as an HTML file. WhatsApp refuses `text/html`, so that channel got a flattened text version and lost the layout entirely. The fix was to serve the sheet as a link.
+
+I was careful about it. Tokens are `secrets.token_urlsafe(16)`. They live in a dict in memory and never touch disk, because `pack.py` promises exactly that. They expire in an hour. `/clear` revokes them. Responses carry `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex`. And the Python server suppresses its own access log, with a comment saying why:
+
+> The default access log records the path, which is the token, and the client address. Logging which pack was opened from where is exactly the per-person analytics this project promises not to keep.
+
+Then I put Caddy in front of it for TLS, using the config from my own runbook:
+
+```
+yojanasathi.avinashnegi.com {
+	log
+	handle /p/* { reverse_proxy 127.0.0.1:8081 }
+}
+```
+
+Caddy sees the request **first**. Within minutes its log held lines shaped like:
+
+```
+"remote_ip":"203.x.x.x"  "uri":"/p/mBhrQ5…"
+```
+
+A client IP, next to a currently valid bearer link to a stranger's benefits sheet. The inner server's refusal to log it was worth nothing at all.
+
+Only my own dead test tokens were ever in there, because no worker has used the feature yet. That is luck, not design.
+
+The lesson is not "remember to configure the proxy". It is that **a privacy property enforced inside one process is not a property of the system.** Every hop that can see the data has to agree, and the hop I forgot was one I had added myself, that same afternoon, and written the runbook for.
+
+So it is now enforced at the proxy rather than left to me to remember:
+
+```
+format filter {
+	fields {
+		request>uri regexp "/p/[^\s?#]+" "/p/REDACTED"
+		request>remote_ip delete
+	}
+}
+```
+
+### 12. A file that argued against its own signature
+
+`data/schemes/uk_widow.toml` is the weakest-sourced of the seven. The original rate citation now 404s. The department's own widow page states no amount. myScheme — the one page that does give ₹1,500/month — links to a *different scheme* as its "Official Website". I read all of it three times across two days and wrote every finding into the file.
+
+Including this line:
+
+> `# ! This is why this file stays unsigned while the other six are signed.`
+
+And then I signed it. `verified_by = "Avinash Negi, checked 2026-09-10"`, four lines below.
+
+Both statements were true when written. The comment was the state on the 9th; the signature was the decision on the 10th. Nothing forced them to agree, so they didn't, and the file spent a day telling every reader that its own signature should not exist.
+
+An external reviewer found it and called it a trust-model contradiction, which is exactly what it is. In most projects that is a documentation bug. Here, provenance **is** the product — the entire argument is "these rules are not AI guesses, here is the source" — so a file contradicting its own provenance attacks the central claim.
+
+I kept the three findings. Evidence that a source was checked three times is the most valuable thing in that file. What I replaced was the conclusion, which now records the decision instead of denying it: signed knowingly, the rate rests on a single non-primary government source, the "not receiving another pension" bar was **removed rather than encoded** because no department page establishes it, and withdrawing the figure is one edit — set `annual_value_inr = "TODO"` and the scheme returns UNKNOWN.
+
+Its sibling `uk_old_age.toml` had the same disease plus two statements that had simply become false: it claimed a condition was "now encoded below" that had since been removed, and claimed the income question asked the stricter of two readings when it asks the other one.
+
+**Comments describing a decision rot the moment the decision changes**, and no test suite checks prose. The only defence I have found is to write down *why* rather than *what*, and to re-read the header every time the body changes.
+
+### 13. `/clearall` took three minutes to answer
+
+I sent `/clearall` at 6:37 and got the reply at 6:39.
+
+Telegram's `deleteMessages` accepts up to 100 ids at once. When a batch was refused — almost always because those messages are older than the 48-hour deletion window — my fallback retried **one API call per id**. Four hundred ids meant up to a thousand requests, on the polling thread, so the worker's next answer queued behind all of it. Telegram then flood-limited the bot, which is why the conversation stayed slow long after the command had finished.
+
+The fix is a budget on *futile* work rather than on work:
+
+```python
+_WASTED_DELETE_BUDGET = 25     # consecutive deletes that found nothing
+_EMPTY_CHUNKS_BEFORE_STOP = 2  # consecutive fruitless chunks before giving up
+```
+
+Counting futile calls rather than total calls matters. An older Bot API with no `deleteMessages` still clears the entire window, because those single calls succeed — only the pointless ones spend budget.
+
+The docstring had always claimed the walk "stops once deletes stop working". The batched path never did. **The comment described the behaviour of code that had since been rewritten** — the same failure as #12, in a different file, found in the same week.
+
+### 14. A custom domain silently switched off the live counter
+
+The landing page reads a small `/stats.json` from the running bot and shows what has actually happened. It is written to hide itself if the fetch fails, so the page degrades to precisely what it was before the feature existed.
+
+Then I pointed a custom domain at GitHub Pages. GitHub applies a user-level custom domain to **every** project page, so the site moved from `avinashnegi1999.github.io/yojana-sathi/` to `avinashnegi.com/yojana-sathi/` and the old URL began 301-ing.
+
+The CORS allowance still named only `github.io`. The browser blocked the request. The section hid itself.
+
+**The failure mode worked perfectly, for entirely the wrong reason.** That is the part worth keeping. A graceful degradation is also a silent failure. I caught it only because I happened to reload from the new address a minute after DNS propagated; a skeleton or a spinner would have screamed. Hiding was the right call for a worker and the wrong one for me.
+
+One header cannot name two origins, so the server now echoes back whichever allowed origin asked, with `Vary: Origin` so a cache cannot replay one origin's response to another. Never `*` — the endpoint answers strangers.
+
 ### The pattern across all of them
 
 | | |
 |---|---|
-| Where the bugs were | conversation layer, adapter, tests, deployment |
+| Where the bugs were | conversation layer, adapter, dashboard, reverse proxy, comments, tests, deployment |
 | Where the bugs were **not** | the rule engine |
 | Most common shape | something looked verified/tested/correct without being it |
 | Most common cause | a check that measured an adjacent thing |
@@ -851,23 +972,33 @@ I keep a scored breakdown in the repo, and the point of writing it down is the l
 
 **The 7 is the honest number and the reason the rest is worth reading.** The engineering is ahead of the product.
 
+An outside review a week later put the engineering at 8.9/10 and then estimated the same project at **65-68/100** against the hackathon's own rubric — because proven impact is 25% of that rubric and mine is worth about 3 of those 25. Both numbers are fair, and the gap between them is the whole story. It is not "build more". Nothing in the second number is a code problem.
+
 What's missing is not code:
 
-- **No real worker has completed a screening.** Nobody outside the build has used this end to end. This is the largest gap and no amount of engineering closes it.
+- **No real worker has completed a screening.** Five screenings have run on the live bot. All five are mine. Nobody outside the build has used this end to end, and no amount of engineering closes that gap — it needs a person to walk into a room with a phone.
+
+  The landing page reads that count from the bot and prints it, captioned *"still maintainer testing, not a field pilot"*. It renders nothing at all until the count is above zero, because a live counter reading `0` claims less than the honest sentence sitting underneath it.
 - **The Hindi and English strings have never been read by a native speaker.** I can build the pipeline; I cannot certify the register of a language I'm writing *for* someone else to hear.
 - **Seven schemes.** National coverage is vastly larger. The authoring path is documented, so adding more is research effort, not engineering effort.
-- **WhatsApp is built but not on a public number**, pending Meta Business Verification.
+- **WhatsApp is built but not on a public number.** Meta Business Verification needs a phone number that has never had WhatsApp installed on it, which costs a second SIM and about ₹1,800 a year to keep alive. I decided against buying one for a channel I am not launching this month. The code stays built, tested and documented as not-public — which is a deployment boundary rather than a gap, and I would rather write that sentence than imply otherwise.
+
+  It is the channel my actual users are on, though, and I know it. Every worker recruited to Telegram has to install an app first. If a partner ever tells me their workers will not do that, the ₹1,800 stops being a cost and starts being obvious.
 - **The follow-up sender is designed and unbuilt.** Storage and purge exist; the sender does not.
 
 There's one open research question I want to name because it is the exact shape of thing this project is built to handle: the PMSBY age cap reached *through* the e-Shram route. e-Shram itself has no upper age bound in the visible FAQ, but a `59` appears inside an unclosed HTML comment in Question 40 and caps PMSBY via that route. **That needs a phone call to a CSC operator, not another reading of the FAQ.**
 
 And one known technical limitation, documented in the code and deliberately not patched over: after a transient Telegram failure, the worker's buttons go dead. Restoring the keyboard would let the old question's buttons answer the new state — the exact bug the message-id guard exists to prevent. A real fix means advancing the `getUpdates` offset only after a turn commits, which risks double-writing events.
 
+What *did* land since I first wrote this section, all of it deployment rather than features: the bot now serves the application sheet as a link on its own subdomain with a real certificate, so a worker opens it in her phone's browser and the print menu offers Save as PDF — the sheet no longer arrives as a file Android often cannot render, and WhatsApp will not have to receive it as flattened text when its turn comes. Tokens expire in an hour, die on restart, and `/clear` revokes them. There is a landing page with a walkthrough video and live counters. None of that moves the number that matters.
+
 **Every item on that list is a person-shaped blocker** — a language review, a recruited user, a phone call, a verification queue. None of them is "the code doesn't work".
 
 For a portfolio project, that's a good place to be stuck, and I'd rather say it plainly than apologise for it.
 
 There is also a non-technical risk sitting above all of this that I have no control over: the hackathon's submission form has a required checkbox saying the project was built using AgentFoundry, the official IDE. This was built locally in Python. I have written to the organisers asking whether importing an existing repo and continuing there qualifies, and I have no reply yet. I've documented the whole question in `docs/AGENTFOUNDRY_MIGRATION.md` rather than quietly ticking a box, which is the only version of this I'd be comfortable defending.
+
+If the answer turns out to be no, the project loses a hackathon and keeps everything else: a live bot, seven scheme files with a citation on every value, and a rule engine I can explain to anyone. I would rather have that and no entry than an entry resting on a checkbox I ticked without believing it.
 
 ---
 
