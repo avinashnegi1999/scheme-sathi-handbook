@@ -1,22 +1,36 @@
-# A rule engine that isn't allowed to guess
+# A Rule Engine That Isn't Allowed to Guess
 
-### Building a welfare-eligibility bot where the expensive failure is a confident wrong answer
+### Building a welfare bot where a confident wrong answer can cost someone a day's wage
+
+Most software fails by crashing. Yojana Sathi has a different problem: it can fail by giving someone a confident answer that turns out to be wrong.
+
+The bot helps workers in India check government welfare schemes. It asks a few questions, checks the rules, and tells them which schemes they may qualify for, what the benefit is, and where they need to go.
+
+But if the bot says **yes** when the real answer is **no**, the cost is not just a bad screen. Someone may take a day off work, pay for transport, wait at a government office, and then be turned away.
+
+A male casual worker in India earned around **₹455 per day in 2025** on average. For a woman, it was around **₹315**.
+
+So before thinking about features, I asked one question:
+
+> **What is the wrong output that costs the user the most?**
+
+For this project, the answer was simple:
+
+> **A wrong “yes”.**
+
+That decision shaped almost everything that came after.
 
 ---
 
-Most software fails by crashing. This one fails by being confidently wrong, and the cost lands on someone else.
+## 1. The AI Cannot Decide Eligibility
 
-The user is an unorganised-sector worker in India — construction, farm labour, domestic work. The bot screens them against government welfare schemes and tells them what they qualify for, what it's worth, and where to go. If it says *yes* and the answer is *no*, that person takes a day off work, borrows a seat in a shared taxi, queues, and is turned away at the counter. A male casual labourer's daily earnings averaged **₹455** in 2025; a woman's, **₹315**.
+The most important rule in the project is simple:
 
-So the design question wasn't "what features?" It was: **what is the wrong output that costs the user most, and in what unit?**
+**The language model is not allowed to decide whether someone qualifies for a scheme.**
 
-Everything below is downstream of that one sentence.
+The eligibility code lives inside `sathi/rules/`. That package is not allowed to import an LLM SDK, HTTP client, or socket.
 
----
-
-## Constraint 1: no language model in the decision path
-
-The rules live in `sathi/rules/`. That package may not import a model, an HTTP client, or a socket. Not by convention — enforced:
+And this is enforced by a test.
 
 ```python
 def test_engine_does_not_import_an_llm():
@@ -24,336 +38,819 @@ def test_engine_does_not_import_an_llm():
         "import sys; import sathi.rules.engine;"
         "banned={'urllib.request','http.client','socket','ssl',"
         "'anthropic','openai','requests'};"
-        "bad=[m for m in sys.modules if m in banned or 'llm' in m.lower()];"
+        "bad=[m for m in sys.modules "
+        "if m in banned or 'llm' in m.lower()];"
         "print(','.join(sorted(bad)))"
     )
+
     out = subprocess.run(
-        [sys.executable, "-c", code], cwd=ROOT,
-        capture_output=True, text=True, check=True
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
+
     assert out == "", f"rules/ pulled in {out}"
 ```
 
-It runs in a **subprocess**, because `sys.modules` in the test process is already polluted by the test runner itself. And it checks module names exactly rather than by prefix — `urllib.parse` is pure string handling and shows up innocently via `pathlib`, so a prefix match would either false-positive or force me to loosen it until it meant nothing.
+The test runs in a subprocess because the main test process already has many imported modules.
 
-The model still has a job: mapping free text to a category, and rephrasing Hindi a human wrote. It never sees a threshold, never produces a ₹ figure, never produces a verdict. And every free-text mapping is confirmed back to the user before it's recorded.
+The model still has a small role. It can help map free text into a category or rephrase Hindi text written by a human.
 
-The whole flow also works with `LLM_API_KEY` unset. That's a tested configuration, not a degraded one — buttons and templated Hindi produce identical verdicts.
+But it never:
+
+* sees an eligibility threshold
+* creates a rupee amount
+* decides ELIGIBLE or INELIGIBLE
+
+The whole flow also works with `LLM_API_KEY` missing.
+
+That is intentional.
+
+If the AI disappears, the eligibility result should stay exactly the same.
 
 ---
 
-## Constraint 2: three-valued logic, all the way down
+## 2. The Engine Has Three Answers
 
-Booleans are the wrong type for this problem. A missing answer is not `False`.
+A normal Boolean gives you two values:
+
+```text
+True
+False
+```
+
+That is not enough for this problem.
+
+If a worker skips a question, `False` would be wrong. We simply do not know yet.
+
+So the rule engine uses three states.
 
 ```python
-def apply(op: str, actual: object, expected: object) -> bool | None:
-    """Compare one profile value against one scheme threshold.
+def apply(
+    op: str,
+    actual: object,
+    expected: object,
+) -> bool | None:
+    """Compare one profile value against one scheme rule."""
 
-    Returns None when the answer is genuinely unknown. Raises OperatorError
-    when the comparison is nonsense (a scheme-file bug the caller reports,
-    never hides).
-    """
     if op == "exists":
-        # * The one operator decidable with no answer: absence IS the answer.
         return actual is not None
 
     if _is_stub(expected):
         return None
 ```
 
-Three outcomes, deliberately distinct:
+The results mean:
 
-| Return | Meaning |
-|---|---|
-| `True` / `False` | decided |
-| `None` | genuinely unknown — missing answer, or an unresearched rule |
-| `OperatorError` | the scheme file is broken; surface it, never swallow it |
+| Result           | Meaning                          |
+| ---------------- | -------------------------------- |
+| `True` / `False` | The condition can be decided     |
+| `None`           | The answer is genuinely unknown  |
+| `OperatorError`  | The scheme rule itself is broken |
 
-That last row matters. Comparing a boolean against an age band is a *data* bug. If it silently evaluated — `bool` is a subclass of `int` in Python, so `True` quietly becomes `1` — a malformed scheme file would produce real verdicts:
+This lets the bot separate:
+
+**“You do not qualify.”**
+
+from:
+
+**“I cannot decide yet.”**
+
+Those are very different answers.
+
+---
+
+## 3. Python Has One Small Trap Here
+
+Python treats `bool` as a subclass of `int`.
+
+That means this is true:
+
+```python
+isinstance(True, int)
+```
+
+For normal programs, that may not matter much.
+
+For an eligibility engine, I do not want `True` quietly becoming `1` in a numeric rule.
+
+So numeric comparisons reject Boolean values directly.
 
 ```python
 def _num(v: object, where: str) -> int | float:
     if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise OperatorError(f"{where}: expected a number, got {v!r}")
+        raise OperatorError(
+            f"{where}: expected a number, got {v!r}"
+        )
+
+    return v
 ```
 
-Stub propagation is recursive, because a threshold can be a list:
+If the scheme file is broken, I want the program to complain.
+
+I do not want it to produce a real eligibility result from bad data.
+
+---
+
+## 4. Unknown Values Are `"TODO"`, Not `0`
+
+One of the smallest decisions in the project turned out to be one of the most useful.
+
+If I have not researched a value yet, I write:
+
+```toml
+annual_value_inr = "TODO"
+```
+
+I do **not** write:
+
+```toml
+annual_value_inr = 0
+```
+
+Why?
+
+Because `0` looks like real data.
+
+It passes type checks, gets added into totals, and may appear to the user as:
+
+```text
+₹0
+```
+
+There is no way to tell whether that means:
+
+> “This scheme pays nothing.”
+
+or:
+
+> “Nobody researched this yet.”
+
+`"TODO"` cannot be mistaken for valid financial data.
+
+The helper also checks inside lists:
 
 ```python
 def _is_stub(v: object) -> bool:
     if v == STUB:
         return True
+
     if isinstance(v, (list, tuple)):
         return any(_is_stub(x) for x in v)
+
     return False
 ```
 
----
+If `"TODO"` appears anywhere in the rule, the engine can return UNKNOWN instead of pretending the information is complete.
 
-## Constraint 3: an unresearched value is `"TODO"`, never `0`
+That taught me a useful rule:
 
-This is the smallest decision with the biggest payoff.
-
-```toml
-annual_value_inr = "TODO"   # not 0
-```
-
-A zero looks researched. It passes type checks, sums cleanly into totals, renders as "₹0" — and no validator can distinguish "this scheme pays nothing" from "nobody has looked this up yet." A string in an integer field cannot be mistaken for either. It propagates to `None` through the operators and surfaces as UNKNOWN.
-
-**Make the unfinished state un-representable.** Every time I moved a safety property from a comment into the type system, it stayed fixed. Every time I wrote it in prose, it rotted — and I have two examples later in this post of exactly that.
+> **If an unfinished state is dangerous, make it difficult to represent as valid data.**
 
 ---
 
-## The two gates
+## 5. A Scheme Must Pass Two Checks
 
-Filling in every value isn't the same as verifying it. One person reading a PDF once is one person reading a PDF once — and I was that person, transcribing figures at 1am.
+Researching a scheme and verifying a scheme are not the same thing.
+
+A scheme only becomes usable when two conditions are true:
+
+1. every required value has been researched
+2. a named human has checked those values against the official source
+
+The code keeps those states separate.
 
 ```python
 @property
 def is_researched(self) -> bool:
-    """No "TODO" left in the file — somebody looked every value up."""
     return not self.stubs
+
 
 @property
 def is_human_verified(self) -> bool:
-    """A named human confirmed every value against the official source."""
     by = self.verified_by.strip()
-    return bool(by) and by != STUB and PENDING_MARKER not in by
+
+    return (
+        bool(by)
+        and by != STUB
+        and PENDING_MARKER not in by
+    )
+
 
 @property
 def is_servable(self) -> bool:
-    """May the engine return a real verdict? Both gates."""
-    return self.is_researched and self.is_human_verified
+    return (
+        self.is_researched
+        and self.is_human_verified
+    )
 ```
 
-`is_servable` is the only property anything checks. Both states routed through one place so they can't drift apart again — they had, once, and a scheme with every value filled but nobody's signature was serving real ELIGIBLE verdicts off unchecked transcription.
+The rest of the application only needs to check:
 
-The engine's precedence order, with servability first:
+```python
+scheme.is_servable
+```
+
+That keeps the safety rule in one place.
+
+I learned this after a scheme once had every value filled in but had not actually been signed off by a human reviewer.
+
+The data looked complete.
+
+It was not verified.
+
+Those are not the same thing.
+
+---
+
+## 6. Evaluation Order Matters
+
+The rule engine follows a strict order.
 
 ```python
 def evaluate(profile: Profile, scheme: Scheme) -> Result:
-    """Decide one scheme for one worker. Pure function.
+    """
+    Order:
 
-    Precedence, in order — a definite NO outranks a maybe:
-      1. scheme not servable            → UNKNOWN, always, no further checking
-      2. any exclusion definitely hits  → INELIGIBLE
-      3. any criterion definitely fails → INELIGIBLE
-      4. anything undecidable           → UNKNOWN
-      5. otherwise                      → ELIGIBLE
+    1. scheme not servable
+       -> UNKNOWN
+
+    2. exclusion definitely applies
+       -> INELIGIBLE
+
+    3. criterion definitely fails
+       -> INELIGIBLE
+
+    4. something cannot be decided
+       -> UNKNOWN
+
+    5. everything passed
+       -> ELIGIBLE
     """
 ```
 
-Rule 1 returning UNKNOWN before checking anything is the point. An unverified scheme cannot produce a verdict *in either direction* — a wrong NO is a missed entitlement, which is just as much a failure as a wrong YES.
+The first rule matters most.
 
-And when it does return UNKNOWN, the ₹ value is zeroed on the way out:
+An unverified scheme cannot return a real answer in either direction.
+
+Not even INELIGIBLE.
+
+Because a wrong **NO** can also hurt someone by hiding a benefit they really qualify for.
+
+And when a scheme is UNKNOWN, the financial value is also removed from the result.
 
 ```python
-annual_value_inr=0,  # ! never let an unverified ₹ reach a metric
+annual_value_inr = 0
 ```
+
+That prevents an unverified rupee amount from reaching dashboards or impact numbers.
 
 ---
 
-## Rules as data, with a citation per value
+## 7. Rules Are Data, Not Python Code
 
-Scheme rules are TOML, not Python. Each criterion carries its own source URL and its own worker-facing text in both languages:
+Government scheme rules are stored in TOML files.
+
+A simplified rule looks like this:
 
 ```toml
 [[criteria]]
-# * Source comparison 2026-09-08: worker status is a separate condition.
-# * Occupation and zero income do not establish or disprove this by themselves.
-field      = "is_unorganised_worker"
-op         = "eq"
-value      = true
-ask_hi     = "क्या आप असंगठित क्षेत्र में कमाई वाला काम करते हैं?"
-pass_hi    = "आपने बताया कि आप असंगठित क्षेत्र में काम करते हैं।"
-fail_hi    = "इस योजना के लिए असंगठित क्षेत्र में काम करना ज़रूरी है।"
-ask_en     = "Do you do income-earning work in the unorganised sector?"
-pass_en    = "You reported that you work in the unorganised sector."
-fail_en    = "This scheme requires work in the unorganised sector."
-source_url = "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2293891&..."
+
+field = "is_unorganised_worker"
+op = "eq"
+value = true
+
+ask_hi = "क्या आप असंगठित क्षेत्र में कमाई वाला काम करते हैं?"
+
+pass_hi = "आपने बताया कि आप असंगठित क्षेत्र में काम करते हैं।"
+
+fail_hi = "इस योजना के लिए असंगठित क्षेत्र में काम करना ज़रूरी है।"
+
+ask_en = "Do you do income-earning work in the unorganised sector?"
+
+pass_en = "You reported that you work in the unorganised sector."
+
+fail_en = "This scheme requires work in the unorganised sector."
+
+source_url = "https://www.pib.gov.in/..."
 ```
 
-Three properties fall out of this that Python-coded rules wouldn't give you:
+I chose this format for a few reasons.
 
-1. **Auditable by a non-programmer.** Someone who knows welfare policy but not Python can check a rule against its source.
-2. **The citation lives beside the value**, not in a doc that drifts.
-3. **The engine can't special-case a scheme**, because it never sees scheme names — only fields, operators and values.
+Someone who understands welfare policy but does not know Python can still review the rule.
 
-Adding a scheme is research work, not engineering work. That's the whole reason for the format.
+The source URL sits beside the value it supports.
 
----
+And the engine never needs to know the scheme name.
 
-## Zero dependencies
+It only sees:
 
-Python 3.11+, standard library only. `tomllib` for the rules, `sqlite3` for the event log, `urllib` written directly against the Telegram and WhatsApp APIs, `assert` for tests.
+```text
+field
+operator
+value
+```
 
-Not asceticism. Three concrete reasons:
+That means adding another government scheme is mainly a research task.
 
-- **Supply chain.** This handles decisions about people's benefits. Every dependency is somebody else's release process.
-- **Deployment.** `git pull && systemctl restart`. No virtualenv drift, no resolver, nothing to break on a `t4g.micro`.
-- **Auditability.** A reviewer checking whether a model touches the decision has to read one codebase, not a tree.
-
-The rule I set: adding one needs a stated reason the stdlib can't do the job. In six weeks nothing cleared it. The pack is HTML rather than PDF for exactly this reason — the stdlib has no PDF writer, and HTML prints fine from a phone.
+It should not require rewriting the engine.
 
 ---
 
-## Testing: coverage counters, because green tests lie
+## 8. No Third-Party Dependencies in the Core
 
-The suite walks every button at every screen in both languages. But a passing test that never reached the code it claims to check is worse than no test — it's an alibi. So the tests assert their own coverage:
+The project currently uses Python 3.11+ and mostly the standard library.
+
+The main pieces are:
+
+```text
+tomllib
+sqlite3
+urllib
+uuid
+hmac
+hashlib
+http.server
+```
+
+This was not about trying to make the code look clever.
+
+There were practical reasons.
+
+### Supply chain
+
+This project deals with information about people's benefits.
+
+Every dependency is another project and another release process to trust.
+
+### Deployment
+
+The production update is close to:
+
+```bash
+git pull
+systemctl restart yojana-sathi
+```
+
+There is less dependency drift to worry about.
+
+### Auditability
+
+If someone wants to check whether an AI model can reach the eligibility logic, they only need to inspect this codebase.
+
+The rule I used was simple:
+
+> Add a dependency only when the standard library cannot reasonably do the job.
+
+So far, that has worked well.
+
+---
+
+## 9. Green Tests Can Still Lie
+
+A passing test does not always mean the important code actually ran.
+
+You can write a test for something and accidentally never reach the state you wanted to test.
+
+So some tests also keep counters.
 
 ```python
-# ! Counters, because a test that never reached the thing it checks is the trap
-assert ended, f"[{code}] no path ever reached the end of a session"
-...
+# ! A passing test is useless if the session never reached the end.
+assert ended, (
+    f"[{code}] no path ever reached the end of a session"
+)
+
+# ! Make sure all expected conversation states were actually visited.
 assert reached == set(State) - {...}
 ```
 
-Current run: **2,541 paths, 217 completed sessions.** Three bugs got past this suite in one day before the counters existed, which is why they exist.
+The current test run explores thousands of paths through the conversation system.
 
-The number that matters more: **not one bug I found lived in the rule engine.** They were all in the layer between the worker and the arithmetic — the adapter, the conversation state, the dashboard, the proxy. The engine survives because it's small, pure, and has no I/O. That's a decent argument for keeping the deciding core as small as you can get away with.
+One thing surprised me.
+
+The important bugs I found were usually **not** inside the rule engine.
+
+They appeared around it:
+
+* conversation state
+* adapters
+* dashboard
+* reporting
+* web proxy
+
+The rule engine stayed stable because it is small, pure, and does almost no I/O.
+
+That gave me another simple lesson:
+
+> **Keep the code making important decisions as small as possible.**
 
 ---
 
-## Four bugs worth the words
+# Four Bugs That Taught Me More Than the Features
 
-### 1. The same double-count, one layer up
+The project still had plenty of mistakes.
 
-Two Uttarakhand pensions are alternative routes to the same payment. Scheme files declare it:
+These four taught me the most.
+
+---
+
+## Bug 1: I Counted the Same Pension Twice
+
+Two Uttarakhand pension schemes are alternative routes to the same payment.
+
+The scheme files know this:
 
 ```toml
 exclusive_group = "uk_state_pension"
 ```
 
-and `engine.value_totals()` collapses a group to its largest member before summing. The worker sees ₹18,000. Correct.
+The rule engine correctly collapses the group before calculating the total.
 
-The **dashboard** did this:
+So a worker sees:
+
+```text
+₹18,000
+```
+
+Correct.
+
+But my dashboard was doing this:
 
 ```sql
-SELECT scheme_code, SUM(value_inr)
+SELECT
+    scheme_code,
+    SUM(value_inr)
+
 FROM events
-WHERE event_type='scheme_newly_surfaced'
+
+WHERE event_type = 'scheme_newly_surfaced'
+
 GROUP BY scheme_code
 ```
 
-No sessions, no groups. One widow reported as ₹36,000 of "entitlement surfaced" against a real ₹18,000.
+The dashboard knew nothing about exclusive groups.
 
-Note the direction: the *user* got the truth, the *statistic about* the user was inflated. Nobody catches an inflated statistic by using the product.
+So one widow could appear as:
 
-I wrote `exclusive_group` to prevent this, then wrote a second place computing the same quantity that didn't use it. **A fix living in one function protects one caller.** `templates.py` and `pack.py` were both made to call `value_totals()`; `report.py` never was, because it reads the event log rather than a live result.
-
-The fix groups per session — and the second assertion matters as much as the first:
-
-```python
-assert split["payout"] == 54000   # one widow: pensions collapse, plus PM-SYM
-assert split["payout"] == 72000   # two DIFFERENT widows: two entitlements
+```text
+₹36,000 entitlement surfaced
 ```
 
-Collapsing is not deduplication.
+when the real amount was:
 
-### 2. A privacy property that stopped at the process boundary
+```text
+₹18,000
+```
 
-The application sheet is served as a link with a `secrets.token_urlsafe(16)` token, held in a module-level dict, expiring in an hour, revoked by `/clear`, never written to disk. The server suppresses its own access log deliberately:
+The user saw the truth.
+
+My statistic was wrong.
+
+That is a dangerous kind of bug because nobody notices it by using the product.
+
+It only shows up later in a dashboard or presentation.
+
+The fix also needed two cases in the tests:
+
+```python
+assert split["payout"] == 54000
+# One widow:
+# alternative pensions collapse.
+
+
+assert split["payout"] == 72000
+# Two different widows:
+# two real entitlements.
+```
+
+Collapsing alternatives is not the same thing as deduplicating people.
+
+---
+
+## Bug 2: Privacy Worked in Python but Failed in Caddy
+
+The bot can create a temporary sheet for the worker.
+
+The link contains a random token:
+
+```python
+secrets.token_urlsafe(16)
+```
+
+It expires after one hour and is never permanently stored.
+
+The Python server also disables its normal access log.
 
 ```python
 def log_message(self, *args) -> None:
-    # ! Silence, deliberately. The default access log records the path,
-    # ! which is the token, and the client address. Logging which pack was
-    # ! opened from where is exactly the per-person analytics this project
-    # ! promises not to keep.
+    # ! Do not log the result-sheet URL.
+    # ! The path contains a live bearer token.
+    # ! Pairing that token with a client IP would create
+    # ! exactly the kind of per-person tracking we avoid.
     pass
 ```
 
-Then I put Caddy in front for TLS, from my own runbook:
+That looked good.
 
-```
+Then I put Caddy in front of the application for HTTPS.
+
+My original configuration contained:
+
+```text
 yojanasathi.avinashnegi.com {
-	log
-	handle /p/* { reverse_proxy 127.0.0.1:8081 }
+    log
+
+    handle /p/* {
+        reverse_proxy 127.0.0.1:8081
+    }
 }
 ```
 
-Caddy sees the request first. Its log immediately held `"remote_ip"` next to `"uri":"/p/<live token>"` — a client IP paired with a valid bearer link to someone's benefits sheet.
+Caddy received the request first.
 
-**A privacy property enforced inside one process is not a property of the system.** Fixed at the proxy, not by remembering:
+Its log contained both:
 
+```text
+remote_ip
 ```
+
+and:
+
+```text
+/p/<live-token>
+```
+
+So the Python process was protecting the data while the proxy was logging it.
+
+The fix had to happen at the proxy level.
+
+```text
 format filter {
-	fields {
-		request>uri regexp "/p/[^\s?#]+" "/p/REDACTED"
-		request>remote_ip delete
-	}
+    fields {
+        request>uri regexp "/p/[^\s?#]+" "/p/REDACTED"
+        request>remote_ip delete
+    }
 }
 ```
 
-### 3. Two files that contradicted themselves
+That changed how I think about privacy.
 
-`uk_widow.toml` carried a comment I wrote honestly on the 9th — *"this is why this file stays unsigned"* — four lines above a signature I added on the 10th. Both true when written; nothing forced them to agree.
+> **A privacy promise inside one program is not enough. The whole system has to follow it.**
 
-For most projects that's a doc bug. Here provenance *is* the product, so a file contradicting its own provenance attacks the central claim.
+---
 
-Its sibling had two statements that had become outright false: it claimed a condition was "now encoded below" that had since been removed, and claimed a question asked the stricter of two readings when it asks the other one.
+## Bug 3: My Comments Became False
 
-**Comments describing a decision rot the moment the decision changes, and no test reads prose.** The only defence I've found: write down *why*, not *what*, and re-read the header whenever the body changes.
+One scheme file had a comment saying:
 
-### 4. A graceful degradation that hid a real failure
+```text
+this is why this file stays unsigned
+```
 
-The landing page fetches `/stats.json` and hides its whole section if the request fails — so the page degrades to exactly what it was before the feature existed.
+That was true when I wrote it.
 
-Then a custom domain moved the site's origin (GitHub applies a user-level domain to every project page). CORS blocked the fetch. The section hid itself, working perfectly, for entirely the wrong reason.
+The next day I verified the source and signed the file.
 
-A skeleton or spinner would have screamed. Hiding was right for a worker and wrong for me.
+I forgot to update the comment.
 
-One header can't name two origins, so the server echoes back whichever allowed origin asked:
+So the same file now effectively said:
+
+```text
+this file should remain unsigned
+```
+
+and:
+
+```text
+verified_by = "..."
+```
+
+Both statements had been correct at different times.
+
+Together they made no sense.
+
+That reminded me of something simple:
+
+> **Comments describing what the code does can become wrong very quickly.**
+
+Now I try to write comments explaining **why** a decision exists instead of repeating what the code already says.
+
+---
+
+## Bug 4: Graceful Failure Hid a Real Bug
+
+The landing page fetches live statistics from:
+
+```text
+/stats.json
+```
+
+If the request fails, the stats section disappears.
+
+That was intentional.
+
+I did not want visitors seeing a broken widget.
+
+Then I changed the site's domain.
+
+CORS blocked the request.
+
+The statistics disappeared exactly as designed.
+
+So the error handling worked perfectly.
+
+For the wrong reason.
+
+A visible error would have told me immediately that something was broken.
+
+Graceful degradation made the problem invisible.
+
+The CORS helper now checks allowed origins.
 
 ```python
 def allowed_origin(asked: str) -> str:
-    """The origin to echo back, or the primary one when unknown."""
-    extra = [o for o in os.environ.get("STATS_ORIGIN", "").split(",") if o.strip()]
-    allowed = tuple(o.strip() for o in extra) + STATS_ORIGINS
-    return asked if asked in allowed else allowed[0]
+    """Return an allowed origin."""
+
+    extra = [
+        origin.strip()
+        for origin in os.environ.get(
+            "STATS_ORIGIN",
+            "",
+        ).split(",")
+        if origin.strip()
+    ]
+
+    allowed = tuple(extra) + STATS_ORIGINS
+
+    return (
+        asked
+        if asked in allowed
+        else allowed[0]
+    )
 ```
 
-With `Vary: Origin`, so a cache can't replay one origin's response to another. Never `*` — the endpoint answers strangers.
+The response also sends:
+
+```text
+Vary: Origin
+```
+
+so a cache does not reuse the response for the wrong site.
+
+This bug taught me that graceful failure is often good for users and bad for developers.
 
 ---
 
-## Privacy by absence
+# Privacy by Not Collecting Data
 
-There is no name field. No phone field. No Aadhaar field. Not stripped — **never defined**, so they cannot be stored by accident.
+One of the easiest ways to protect sensitive information is to never collect it.
 
-The event log holds coarse bands only (state, age band, occupation, income band) under a fresh `uuid4` per conversation that is not derived from the messaging id. Two sessions by the same person are unlinkable by design.
+The worker profile has no field for:
 
-The one place a stable identifier is needed — counting unique reach — uses an HMAC of the channel id with `INSERT OR IGNORE` on a primary key as the only dedupe guard. And the dashboard label says what the data actually supports:
+```text
+name
+phone number
+Aadhaar number
+```
 
-> messaging accounts reached, counted once each
+Those values are not collected and deleted later.
 
-Not "people". One human with a Telegram account and a WhatsApp number is two rows, because the identifiers hash differently and nothing links them — the same design that stops us knowing who anyone is.
+They are simply not part of the profile model.
+
+The event log only keeps broad categories such as:
+
+```text
+state
+age band
+occupation
+income band
+```
+
+Each conversation receives a new random ID:
+
+```python
+uuid.uuid4()
+```
+
+That ID is not based on the person's Telegram or WhatsApp identifier.
+
+So two conversations from the same person cannot automatically be linked.
 
 ---
 
-## Where it stands
+## Counting Reach Without Storing Identity
 
-Live on Telegram, seven schemes, each value read against its official source and signed with a name and date. Runs under `systemd` on a `t4g.micro` behind Caddy, with a Docker path that runs the full suite at image build time.
+There is one place where I need a stable identifier.
 
-**Five screenings have completed on the live bot. All five are mine.**
+I need to avoid counting the same messaging account repeatedly when measuring reach.
 
-The landing page prints that number, fetched live, captioned *still maintainer testing, not a field pilot* — and renders nothing at all until the count exceeds zero, because a counter reading `0` claims less than the honest sentence beneath it.
+For that, the messaging identifier is HMAC-hashed before being stored.
 
-Every remaining blocker is person-shaped: a native Hindi speaker who hasn't read the script aloud, workers not yet recruited, a phone call to a district office that a fourth reading of a web page won't settle.
+The database uses:
+
+```sql
+INSERT OR IGNORE
+```
+
+with the hash as the primary key.
+
+But even here, I have to be careful with wording.
+
+The dashboard says:
+
+> **messaging accounts reached, counted once each**
+
+It does **not** say:
+
+> people reached
+
+One person may use Telegram and WhatsApp.
+
+Those appear as two different accounts because the system deliberately does not try to connect them.
+
+The privacy design makes the metric less impressive.
+
+But it makes it more honest.
 
 ---
 
-## The transferable part
+# Where the Project Stands
 
-**Write down the expensive mistake before the first line of code.** Not a feature list. One sentence: *what wrong output costs my user most, and in what unit?*
+Yojana Sathi is live.
 
-Mine was: *a wrong yes costs a day's wage and a wasted journey, and most people don't come back.*
+It currently supports **seven government schemes**.
 
-Three-valued verdicts, `"TODO"` over `0`, a two-gate servability check, a model structurally barred from the decision — none of those were clever. Each is the obvious consequence of that sentence. The sentence did the work.
+Each rule has been checked against its official source and carries a verifier name and date.
+
+The production service runs behind Caddy and `systemd`.
+
+But there is one number I do not want to hide:
+
+> **Five screenings have been completed on the live bot. All five were mine.**
+
+This is still maintainer testing.
+
+It is not a field pilot yet.
+
+The next problems are mostly not programming problems.
+
+I need:
+
+* native Hindi speakers to read the conversation naturally
+* real workers to try the bot
+* feedback from people who actually use government schemes
+* calls to local offices when official web pages are unclear
+
+That is probably a good sign.
+
+The project is slowly moving from:
+
+> **software I built**
+
+to:
+
+> **software that has to work for people who are not me**
 
 ---
 
-*Apache-2.0. Code: [github.com/avinashnegi1999/yojana-sathi](https://github.com/avinashnegi1999/yojana-sathi) · Site: [avinashnegi.com/yojana-sathi](https://avinashnegi.com/yojana-sathi/) · Bot: [@YojanaSathiBot](https://t.me/YojanaSathiBot)*
+# The Main Lesson
 
-*`docs/BUILD_LOG.md` in the repo is the unedited version — every bug and wrong turn, nothing tidied up afterwards.*
+Before writing the first feature, I think it is worth finishing one sentence:
+
+> **What wrong output costs my user the most, and what does that mistake cost them?**
+
+For Yojana Sathi, mine was:
+
+> **A wrong yes can cost someone a day's wage and a wasted journey.**
+
+Most of the architecture followed from that.
+
+Three-valued logic.
+
+`"TODO"` instead of fake data.
+
+Human verification.
+
+AI kept outside the eligibility decision.
+
+Temporary links.
+
+Minimal data collection.
+
+None of these ideas are especially clever.
+
+They are just consequences of taking the cost of a wrong answer seriously.
+
+---
+
+*Yojana Sathi is open source under Apache-2.0.*
+
+**Code:** [github.com/avinashnegi1999/yojana-sathi](https://github.com/avinashnegi1999/yojana-sathi)
+
+**Website:** [avinashnegi.com/yojana-sathi](https://avinashnegi.com/yojana-sathi/)
+
+**Telegram bot:** [@YojanaSathiBot](https://t.me/YojanaSathiBot)
+
+The repository also contains `docs/BUILD_LOG.md`, where I kept the longer version with the bugs, mistakes, and wrong turns instead of cleaning them up afterwards.
